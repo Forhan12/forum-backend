@@ -114,7 +114,17 @@ app.get("/threads", async (req, res) => {
   const threads = await Thread.find();
 
   const sorted = threads
-    .map(t => ({ ...t.toObject(), score: calculateTrendingScore(t) }))
+    .map(t => {
+      const obj = t.toObject();
+
+      const ageHours =
+        (Date.now() - new Date(t.createdAt)) / (1000 * 60 * 60);
+
+      const score =
+        t.upvotes / Math.pow(ageHours + 2, 1.5); // trending formula
+
+      return { ...obj, score };
+    })
     .sort((a, b) => b.score - a.score);
 
   res.json(sorted);
