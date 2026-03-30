@@ -153,6 +153,9 @@ app.post("/threads/:tid/comment/:cid/upvote", async (req, res) => {
   await t.save();
 
   res.json({ upvotes: c.upvotes });
+  if (t.comments.some(c => c.user === user)) {
+  return res.status(400).json({ error: "Already commented" });
+}
 });
 
 // ================= SOCKET =================
