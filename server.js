@@ -156,7 +156,7 @@ app.post("/threads/:tid/comment/:cid/upvote", async (req, res) => {
 });
 
 // ================= SOCKET =================
-
+const socket = io("https://forum-backend-t92d.onrender.com");
 io.on("connection", socket => {
   socket.on("joinThread", id => socket.join(id));
 
