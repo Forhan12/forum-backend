@@ -1,0 +1,218 @@
+const express = require("express");
+const mongoose = require("mongoose");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+app.use(cors({ origin: "*" }));
+app.use(express.json());
+
+// MongoDB
+mongoose.connect(process.env.MONGO_URI || "mongodb://127.0.0.1:27017/forum");
+
+// ================= MODELS =================
+
+const CommentSchema = new mongoose.Schema({
+  user: String,
+  text: String,
+  createdAt: { type: Date, default: Date.now },
+  upvotes: { type: Number, default: 0 },
+  upvotedBy: [String],
+  replies: []
+});
+
+const Thread = mongoose.model("Thread", {
+  title: String,
+  createdAt: { type: Date, default: Date.now },
+  upvotes: { type: Number, default: 0 },
+  upvotedBy: [String],
+  comments: [CommentSchema]
+});
+
+const User = mongoose.model("User", {
+  username: { type: String, unique: true },
+  code: String
+});
+
+// ================= HELPERS =================
+
+async function generateCode() {
+  let code;
+  let exists = true;
+
+  while (exists) {
+    code = Math.floor(1000 + Math.random() * 9000).toString();
+    const user = await User.findOne({ code });
+    if (!user) exists = false;
+  }
+
+  return code;
+}
+
+function calculateTrendingScore(thread) {
+  const now = new Date();
+  const hours = (now - new Date(thread.createdAt)) / 3600000;
+
+  const commentCount = thread.comments.length;
+  const recent = thread.comments.filter(c => {
+    return (now - new Date(c.createdAt)) / 3600000 < 6;
+  }).length;
+
+  return commentCount * 2 + recent * 3 + thread.upvotes * 4 + (hours < 24 ? 5 : 0);
+}
+
+function findComment(comments, id) {
+  for (let c of comments) {
+    if (c._id.toString() === id) return c;
+    const found = findComment(c.replies, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function addReply(comments, parentId, reply) {
+  for (let c of comments) {
+    if (c._id.toString() === parentId) {
+      c.replies.push(reply);
+      return true;
+    }
+    if (addReply(c.replies, parentId, reply)) return true;
+  }
+  return false;
+}
+
+// ================= AUTH =================
+
+app.post("/signup", async (req, res) => {
+  const { username } = req.body;
+
+  if (await User.findOne({ username }))
+    return res.status(400).json({ error: "Username taken" });
+
+  const code = await generateCode();
+  await new User({ username, code }).save();
+
+  res.json({ code });
+});
+
+app.post("/login", async (req, res) => {
+  const { username, code } = req.body;
+
+  const user = await User.findOne({ username, code });
+  if (!user) return res.status(400).json({ error: "Invalid login" });
+
+  res.json({ success: true });
+});
+
+// ================= THREADS =================
+
+app.get("/threads", async (req, res) => {
+  const threads = await Thread.find();
+
+  const sorted = threads
+    .map(t => ({ ...t.toObject(), score: calculateTrendingScore(t) }))
+    .sort((a, b) => b.score - a.score);
+
+  res.json(sorted);
+});
+
+app.post("/threads", async (req, res) => {
+  const t = await new Thread({ title: req.body.title }).save();
+  res.json(t);
+});
+
+// ================= UPVOTES =================
+
+app.post("/threads/:id/upvote", async (req, res) => {
+  const { username } = req.body;
+  const t = await Thread.findById(req.params.id);
+
+  if (t.upvotedBy.includes(username))
+    return res.status(400).json({ error: "Already upvoted" });
+
+  t.upvotes++;
+  t.upvotedBy.push(username);
+  await t.save();
+
+  res.json({ upvotes: t.upvotes });
+});
+
+app.post("/threads/:tid/comment/:cid/upvote", async (req, res) => {
+  const { username } = req.body;
+  const t = await Thread.findById(req.params.tid);
+  const c = findComment(t.comments, req.params.cid);
+
+  if (!c || c.upvotedBy.includes(username)) return res.sendStatus(400);
+
+  c.upvotes++;
+  c.upvotedBy.push(username);
+  await t.save();
+
+  res.json({ upvotes: c.upvotes });
+});
+
+// ================= SOCKET =================
+
+io.on("connection", socket => {
+  socket.on("joinThread", id => socket.join(id));
+
+  socket.on("comment", async ({ threadId, user, text }) => {
+    const t = await Thread.findById(threadId);
+
+    const comment = {
+      _id: new mongoose.Types.ObjectId(),
+      user,
+      text,
+      createdAt: new Date(),
+      upvotes: 0,
+      upvotedBy: [],
+      replies: []
+    };
+
+    t.comments.push(comment);
+    await t.save();
+
+    io.to(threadId).emit("newComment", comment);
+  });
+
+  socket.on("reply", async ({ threadId, parentId, user, text }) => {
+    const t = await Thread.findById(threadId);
+
+    const reply = {
+      _id: new mongoose.Types.ObjectId(),
+      user,
+      text,
+      createdAt: new Date(),
+      upvotes: 0,
+      upvotedBy: [],
+      replies: []
+    };
+
+    addReply(t.comments, parentId, reply);
+    await t.save();
+
+    io.to(threadId).emit("newReply", { parentId, reply });
+  });
+
+  socket.on("upvoteComment", async ({ threadId, commentId, username }) => {
+    const t = await Thread.findById(threadId);
+    const c = findComment(t.comments, commentId);
+
+    if (!c || c.upvotedBy.includes(username)) return;
+
+    c.upvotes++;
+    c.upvotedBy.push(username);
+    await t.save();
+
+    io.to(threadId).emit("commentUpvoted", {
+      commentId,
+      upvotes: c.upvotes
+    });
+  });
+});
+
+server.listen(3000, () => console.log("Server running"));
